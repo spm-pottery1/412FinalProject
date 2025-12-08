@@ -3,6 +3,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
+const OpenAI = require('openai');
 require('dotenv').config();
 
 const db = require('./config/db');
@@ -10,6 +11,11 @@ const authenticateToken = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Initialize OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
 // Middleware
 app.use(cors()); // Enable CORS for frontend
@@ -362,6 +368,300 @@ app.delete('/api/messages/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// ==================== GROUP CHAT ROUTES ====================
+
+/**
+ * GET /api/groups
+ * Get all groups user is a member of (protected route)
+ */
+app.get('/api/groups', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT g.*, u.username as creator_username,
+              COUNT(DISTINCT gm.user_id) as member_count
+       FROM groups g
+       JOIN users u ON g.created_by = u.id
+       JOIN group_members gm ON g.id = gm.group_id
+       WHERE g.id IN (
+         SELECT group_id FROM group_members WHERE user_id = $1
+       )
+       GROUP BY g.id, u.username
+       ORDER BY g.created_at DESC`,
+      [req.user.id]
+    );
+
+    res.json({ groups: result.rows });
+  } catch (error) {
+    console.error('Error fetching groups:', error);
+    res.status(500).json({ error: 'Server error fetching groups' });
+  }
+});
+
+/**
+ * POST /api/groups
+ * Create a new group (protected route)
+ */
+app.post('/api/groups', [
+  authenticateToken,
+  body('name').notEmpty().trim(),
+  body('description').optional().trim()
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
+  const { name, description } = req.body;
+
+  try {
+    // Create group
+    const groupResult = await db.query(
+      'INSERT INTO groups (name, description, created_by) VALUES ($1, $2, $3) RETURNING *',
+      [name, description, req.user.id]
+    );
+
+    const group = groupResult.rows[0];
+
+    // Add creator as member
+    await db.query(
+      'INSERT INTO group_members (group_id, user_id) VALUES ($1, $2)',
+      [group.id, req.user.id]
+    );
+
+    res.status(201).json({
+      message: 'Group created successfully',
+      group
+    });
+  } catch (error) {
+    console.error('Error creating group:', error);
+    res.status(500).json({ error: 'Server error creating group' });
+  }
+});
+
+/**
+ * POST /api/groups/:groupId/members
+ * Add member to group (protected route)
+ */
+app.post('/api/groups/:groupId/members', [
+  authenticateToken,
+  body('user_id').isInt()
+], async (req, res) => {
+  const { groupId } = req.params;
+  const { user_id } = req.body;
+
+  try {
+    // Check if requester is a member
+    const memberCheck = await db.query(
+      'SELECT * FROM group_members WHERE group_id = $1 AND user_id = $2',
+      [groupId, req.user.id]
+    );
+
+    if (memberCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'You are not a member of this group' });
+    }
+
+    // Add new member
+    await db.query(
+      'INSERT INTO group_members (group_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [groupId, user_id]
+    );
+
+    res.json({ message: 'Member added successfully' });
+  } catch (error) {
+    console.error('Error adding member:', error);
+    res.status(500).json({ error: 'Server error adding member' });
+  }
+});
+
+/**
+ * GET /api/groups/:groupId/messages
+ * Get all messages in a group (protected route)
+ */
+app.get('/api/groups/:groupId/messages', authenticateToken, async (req, res) => {
+  const { groupId } = req.params;
+
+  try {
+    // Check if user is a member
+    const memberCheck = await db.query(
+      'SELECT * FROM group_members WHERE group_id = $1 AND user_id = $2',
+      [groupId, req.user.id]
+    );
+
+    if (memberCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'You are not a member of this group' });
+    }
+
+    // Get messages
+    const result = await db.query(
+      `SELECT gm.*, u.username as sender_username
+       FROM group_messages gm
+       JOIN users u ON gm.sender_id = u.id
+       WHERE gm.group_id = $1
+       ORDER BY gm.created_at ASC`,
+      [groupId]
+    );
+
+    res.json({ messages: result.rows });
+  } catch (error) {
+    console.error('Error fetching group messages:', error);
+    res.status(500).json({ error: 'Server error fetching messages' });
+  }
+});
+
+/**
+ * POST /api/groups/:groupId/messages
+ * Send message to group (protected route)
+ */
+app.post('/api/groups/:groupId/messages', [
+  authenticateToken,
+  body('content').notEmpty().trim()
+], async (req, res) => {
+  const { groupId } = req.params;
+  const { content } = req.body;
+
+  try {
+    // Check if user is a member
+    const memberCheck = await db.query(
+      'SELECT * FROM group_members WHERE group_id = $1 AND user_id = $2',
+      [groupId, req.user.id]
+    );
+
+    if (memberCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'You are not a member of this group' });
+    }
+
+    // Insert message
+    const result = await db.query(
+      'INSERT INTO group_messages (group_id, sender_id, content) VALUES ($1, $2, $3) RETURNING *',
+      [groupId, req.user.id, content]
+    );
+
+    res.status(201).json({
+      message: 'Message sent successfully',
+      data: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Error sending group message:', error);
+    res.status(500).json({ error: 'Server error sending message' });
+  }
+});
+
+/**
+ * GET /api/groups/:groupId/members
+ * Get all members of a group (protected route)
+ */
+app.get('/api/groups/:groupId/members', authenticateToken, async (req, res) => {
+  const { groupId } = req.params;
+
+  try {
+    const result = await db.query(
+      `SELECT u.id, u.username, u.email, gm.joined_at
+       FROM group_members gm
+       JOIN users u ON gm.user_id = u.id
+       WHERE gm.group_id = $1
+       ORDER BY gm.joined_at ASC`,
+      [groupId]
+    );
+
+    res.json({ members: result.rows });
+  } catch (error) {
+    console.error('Error fetching group members:', error);
+    res.status(500).json({ error: 'Server error fetching members' });
+  }
+});
+
+// ==================== AI CHATBOT ROUTES ====================
+
+/**
+ * POST /api/ai/chat
+ * Send message to AI chatbot (protected route)
+ */
+app.post('/api/ai/chat', [
+  authenticateToken,
+  body('message').notEmpty().trim()
+], async (req, res) => {
+  const { message } = req.body;
+
+  try {
+    // Call OpenAI API
+    const completion = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [
+        {
+          role: "system",
+          content: "You are a helpful assistant in a messaging app. Be concise and friendly."
+        },
+        {
+          role: "user",
+          content: message
+        }
+      ],
+      max_tokens: 500,
+      temperature: 0.7
+    });
+
+    const aiResponse = completion.choices[0].message.content;
+
+    // Save to database
+    await db.query(
+      'INSERT INTO ai_chat_history (user_id, message, response) VALUES ($1, $2, $3)',
+      [req.user.id, message, aiResponse]
+    );
+
+    res.json({
+      message: aiResponse,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error with AI chat:', error);
+    
+    // Check if it's an OpenAI API error
+    if (error.status === 401) {
+      return res.status(500).json({ 
+        error: 'AI service not configured. Please add your OpenAI API key to .env file' 
+      });
+    }
+    
+    res.status(500).json({ error: 'Server error processing AI request' });
+  }
+});
+
+/**
+ * GET /api/ai/history
+ * Get AI chat history for current user (protected route)
+ */
+app.get('/api/ai/history', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT * FROM ai_chat_history WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
+      [req.user.id]
+    );
+
+    res.json({ history: result.rows });
+  } catch (error) {
+    console.error('Error fetching AI history:', error);
+    res.status(500).json({ error: 'Server error fetching history' });
+  }
+});
+
+/**
+ * DELETE /api/ai/history
+ * Clear AI chat history (protected route)
+ */
+app.delete('/api/ai/history', authenticateToken, async (req, res) => {
+  try {
+    await db.query(
+      'DELETE FROM ai_chat_history WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    res.json({ message: 'Chat history cleared successfully' });
+  } catch (error) {
+    console.error('Error clearing AI history:', error);
+    res.status(500).json({ error: 'Server error clearing history' });
+  }
+});
+
 // ==================== HEALTH CHECK ====================
 
 /**
@@ -378,6 +678,41 @@ app.get('/api/health', (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 API available at http://localhost:${PORT}/api`);
+  console.log(` Server running on port ${PORT}`);
+  console.log(` API available at http://localhost:${PORT}/api`);
+});
+
+/** 
+ * POST /api/groups/:groupId/members
+ * Add member to group (protected route)
+ */
+app.post('/api/groups/:groupId/members', [
+  authenticateToken,
+  body('user_id').isInt()
+], async (req, res) => {
+  const { groupId } = req.params;
+  const { user_id } = req.body;
+
+  try {
+    // 1. Check if the requester is already a member of this group
+    const memberCheck = await db.query(
+      'SELECT * FROM group_members WHERE group_id = $1 AND user_id = $2',
+      [groupId, req.user.id]
+    );
+
+    if (memberCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'You must be a member to add others' });
+    }
+
+    // 2. Add the new member (ON CONFLICT prevents duplicate memberships)
+    await db.query(
+      'INSERT INTO group_members (group_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [groupId, user_id]
+    );
+
+    res.json({ message: 'Member added successfully' });
+  } catch (error) {
+    console.error('Error adding member:', error);
+    res.status(500).json({ error: 'Server error adding member' });
+  }
 });
